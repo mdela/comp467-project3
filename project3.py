@@ -130,6 +130,8 @@ def filter_and_write_xls_and_snippets(video_filename, xls_filename, fps=24):
     ws = wb.active
     ws.title = "Frames to Fix"
 
+    ws_outside = wb.create_sheet("Out of Video Ranges")
+
     # Write metadata
     ws.append(["Producer", producer])
     ws.append(["Operator", operator])
@@ -137,29 +139,26 @@ def filter_and_write_xls_and_snippets(video_filename, xls_filename, fps=24):
     ws.append([])
     ws.append(["Location", "Frames to Fix", "Timecode", "Thumbnail"])
 
+    ws_outside.append(["Location", "Frames to Fix", "Timecode"])
+
     entries = list(baselight_collection.find({}))
     for entry in entries:
         frame_data = entry['frame']
         location = entry['location']
 
-        if '-' in frame_data:  # Only process ranges
+        if '-' in frame_data:  # Process ranges
             start, end = map(int, frame_data.split('-'))
+            timecode = f"{frame_to_timecode(start, fps)} - {frame_to_timecode(end, fps)}"
             if start <= total_frames and end <= total_frames:
-                start_timecode = frame_to_timecode(start, fps)
-                end_timecode = frame_to_timecode(end, fps)
-                timecode = f"{start_timecode} - {end_timecode}"
-
-                # Generate thumbnail
+                # Valid ranges
                 middle_frame = (start + end) // 2
                 thumbnail_path = f"thumbnails/thumb_{start}_{end}.jpg"
                 generate_thumbnail(video_filename, middle_frame, thumbnail_path)
 
-                # Add thumbnail and snippet info
                 ws.append([location, frame_data, timecode])
                 img = OpenpyxlImage(thumbnail_path)
                 ws.add_image(img, f"D{ws.max_row}")
 
-                # Create snippet
                 snippet_path = f"snippets/{start}-{end}.mp4"
                 cmd = [
                     'ffmpeg', '-i', video_filename,
@@ -167,10 +166,18 @@ def filter_and_write_xls_and_snippets(video_filename, xls_filename, fps=24):
                     '-c', 'copy', snippet_path
                 ]
                 subprocess.run(cmd, capture_output=True)
-                print(f"Snippet created: {snippet_path}")
+            else:
+                # Out-of-range
+                ws_outside.append([location, frame_data, timecode])
+        else:
+            # Individual frames
+            frame = int(frame_data)
+            timecode = frame_to_timecode(frame, fps)
+            if frame > total_frames:
+                ws_outside.append([location, frame_data, timecode])
 
     wb.save(xls_filename)
-    print(f"XLS file created with thumbnails: {xls_filename}")
+    print(f"XLS file created with thumbnails and out-of-range data: {xls_filename}")
 
 # Main function with argparse
 def main():
