@@ -3,6 +3,7 @@ import re
 import subprocess
 from pymongo import MongoClient
 import pandas as pd
+import os
 
 # MongoDB connection setup
 client = MongoClient('mongodb://localhost:27017/')
@@ -27,15 +28,13 @@ def frame_to_timecode(frame, fps):
     frames = frame % fps
     return f"{hours:02}:{minutes:02}:{seconds:02}:{frames:02}"
 
-# Function to process the Xytech file and populate the xytech_collection
+# Function to process the Xytech file
 def process_xytech_file(xytech_filename):
     location_map = {}
-    producer = ''
-    operator = ''
-    job = ''
-    notes = ''
-
     with open(xytech_filename, 'r') as xytech_file:
+        producer = ''
+        operator = ''
+        job = ''
         for line in xytech_file:
             line = line.strip()
             if line.startswith('Producer:'):
@@ -44,21 +43,16 @@ def process_xytech_file(xytech_filename):
                 operator = line.split(':', 1)[1].strip()
             elif line.startswith('Job:'):
                 job = line.split(':', 1)[1].strip()
-            elif line.startswith('Notes:'):
-                notes = line.split(':', 1)[1].strip()
             elif line:
                 stripped_location = re.sub(r'^/hpsans\d+/production', '', line)
                 location_map[stripped_location] = line
 
-    # Populate the xytech_collection with metadata and locations
     xytech_collection.insert_one({
         'producer': producer,
         'operator': operator,
         'job': job,
-        'notes': notes,
         'locations': [{'stripped': k, 'full': v} for k, v in location_map.items()]
     })
-    print(f"Xytech data inserted into collection with producer: {producer}, operator: {operator}, job: {job}")
     return location_map
 
 # Function to process the Baselight file and populate the database
@@ -108,16 +102,20 @@ def process_baselight_file(baselight_filename, location_map):
             })
 
         i += 1
-    print(f"Baselight data inserted into collection from file: {baselight_filename}")
 
 # Function to calculate timecodes for ranges within the video length and write to XLS
 def filter_and_write_xls(video_filename, xls_filename, fps=24):
     video_length_seconds = get_video_length(video_filename)
     total_frames = int(video_length_seconds * fps)
 
+    xytech_data = xytech_collection.find_one()
+    producer = xytech_data.get('producer', '') if xytech_data else ''
+    operator = xytech_data.get('operator', '') if xytech_data else ''
+    job = xytech_data.get('job', '') if xytech_data else ''
+
     # Filter ranges within video length and calculate timecodes
     entries = list(baselight_collection.find({}))
-    rows = []
+    rows = [["Producer", producer], ["Operator", operator], ["Job", job], [], ["Location", "Frames to Fix", "Timecode"]]
 
     for entry in entries:
         frame_data = entry['frame']
@@ -132,21 +130,43 @@ def filter_and_write_xls(video_filename, xls_filename, fps=24):
                 rows.append([location, frame_data, timecode])
 
     # Write filtered ranges to XLS file
-    if not rows:
-        print("No valid ranges found within video length.")
-        return
-
-    df = pd.DataFrame(rows, columns=["Location", "Frames to Fix", "Timecode"])
-    df.to_excel(xls_filename, index=False, engine='openpyxl')
+    df = pd.DataFrame(rows)
+    df.to_excel(xls_filename, index=False, header=False, engine='openpyxl')
     print(f"XLS file created with filtered ranges: {xls_filename}")
 
-# Main function with argparse for input files and XLS creation
+# Function to extract video snippets based on timecode ranges
+def extract_snippets(video_filename, fps=24):
+    video_length_seconds = get_video_length(video_filename)
+    total_frames = int(video_length_seconds * fps)
+
+    entries = list(baselight_collection.find({}))
+    os.makedirs("snippets", exist_ok=True)
+
+    for entry in entries:
+        frame_data = entry['frame']
+
+        if '-' in frame_data:  # Only process ranges
+            start, end = map(int, frame_data.split('-'))
+            if start <= total_frames and end <= total_frames:
+                start_time = start / fps
+                end_time = end / fps
+                output_file = f"snippets/{start}-{end}.mp4"
+
+                cmd = [
+                    'ffmpeg', '-i', video_filename,
+                    '-ss', f"{start_time}", '-to', f"{end_time}",
+                    '-c', 'copy', output_file
+                ]
+                subprocess.run(cmd, capture_output=True)
+                print(f"Snippet created: {output_file}")
+
+# Main function with argparse for input files and XLS/snippet creation
 def main():
-    parser = argparse.ArgumentParser(description="Process Baselight files, calculate timecodes, and generate XLS.")
+    parser = argparse.ArgumentParser(description="Process Baselight files, calculate timecodes, and generate XLS/snippets.")
     parser.add_argument('--xytech', required=True, help="Path to the Xytech file")
     parser.add_argument('--baselight', required=True, help="Path to the Baselight file")
-    parser.add_argument('--process', required=True, help="Path to the video file for XLS generation")
-    parser.add_argument('--outputXLS', required=True, help="Path to save the XLS file")
+    parser.add_argument('--process', help="Path to the video file for snippet creation")
+    parser.add_argument('--outputXLS', help="Path to save the XLS file")
     args = parser.parse_args()
 
     # Process Xytech file
@@ -155,8 +175,13 @@ def main():
     # Process Baselight file
     process_baselight_file(args.baselight, location_map)
 
-    # Filter ranges and write to XLS
-    filter_and_write_xls(args.process, args.outputXLS)
+    if args.outputXLS:
+        # Filter ranges and write to XLS
+        filter_and_write_xls(args.process, args.outputXLS)
+
+    if args.process:
+        # Extract video snippets
+        extract_snippets(args.process)
 
 if __name__ == '__main__':
     main()
