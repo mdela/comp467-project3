@@ -7,34 +7,37 @@ import os
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
 
-# MongoDB connection setup
+# mongodb connection setup to store baselight and xytech data
 client = MongoClient('mongodb://localhost:27017/')
 db = client['video_processing']
 baselight_collection = db['baselight']
 xytech_collection = db['xytech']
 
-# Ensure necessary directories exist
+# create necessary directories for storing thumbnails and snippets if they don't exist
 os.makedirs("thumbnails", exist_ok=True)
 os.makedirs("snippets", exist_ok=True)
 
-# Function to calculate video length using FFprobe
+# function to calculate the length of the video using ffprobe
 def get_video_length(video_path):
+    # call ffprobe to get video duration
     cmd = [
         'ffprobe', '-i', video_path, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0'
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    duration_seconds = float(result.stdout.strip())
+    duration_seconds = float(result.stdout.strip())  # get video duration in seconds
     return duration_seconds
 
-# Function to convert frames to timecode
+# function to convert frame number to timecode format (hh:mm:ss:ff)
 def frame_to_timecode(frame, fps):
+    # calculate hours, minutes, seconds, and frame count based on fps
     hours = frame // (fps * 3600)
     minutes = (frame // (fps * 60)) % 60
     seconds = (frame // fps) % 60
     frames = frame % fps
+    # return formatted timecode as string
     return f"{hours:02}:{minutes:02}:{seconds:02}:{frames:02}"
 
-# Function to process the Xytech file
+# function to process the xytech file, extracting relevant information about producer, operator, job, and locations
 def process_xytech_file(xytech_filename):
     location_map = {}
     with open(xytech_filename, 'r') as xytech_file:
@@ -50,18 +53,21 @@ def process_xytech_file(xytech_filename):
             elif line.startswith('Job:'):
                 job = line.split(':', 1)[1].strip()
             elif line:
+                # clean the location path to strip unnecessary prefix
                 stripped_location = re.sub(r'^/hpsans\d+/production', '', line)
                 location_map[stripped_location] = line
 
+    # store the parsed data into the database
     xytech_collection.insert_one({
         'producer': producer,
         'operator': operator,
         'job': job,
         'locations': [{'stripped': k, 'full': v} for k, v in location_map.items()]
     })
+    # return the map of locations
     return location_map
 
-# Function to process the Baselight file and populate the database
+# function to process the baselight file and map frame locations to the corresponding file locations
 def process_baselight_file(baselight_filename, location_map):
     frames_locations = {}
 
@@ -71,19 +77,23 @@ def process_baselight_file(baselight_filename, location_map):
             if not line:
                 continue
 
+            # split each line into parts (location and frame numbers)
             parts = line.split()
             location_part = parts[0]
             frame_numbers = parts[1:]
 
+            # strip the location path and check if it's in the location map
             stripped_location = re.sub(r'^/baselightfilesystem1', '', location_part)
 
             if stripped_location in location_map:
                 location_fixed = location_map[stripped_location]
 
+                # map each frame to its corresponding location
                 for frame in frame_numbers:
                     if frame.isdigit():
                         frames_locations[int(frame)] = location_fixed
 
+    # sort frames and merge consecutive ones with the same location
     frames_sorted = sorted(frames_locations.items())
     i = 0
     while i < len(frames_sorted):
@@ -91,10 +101,12 @@ def process_baselight_file(baselight_filename, location_map):
         location = frames_sorted[i][1]
         end_frame = start_frame
 
+        # merge consecutive frames if they share the same location
         while i + 1 < len(frames_sorted) and frames_sorted[i + 1][0] == end_frame + 1 and frames_sorted[i + 1][1] == location:
             end_frame = frames_sorted[i + 1][0]
             i += 1
 
+        # insert either a single frame or a range of frames into the database
         if start_frame == end_frame:
             baselight_collection.insert_one({
                 'location': location,
@@ -108,57 +120,64 @@ def process_baselight_file(baselight_filename, location_map):
 
         i += 1
 
-# Function to generate a thumbnail for the middle frame of a range
+# function to generate a thumbnail image for a specific frame from the video
 def generate_thumbnail(video_filename, frame, output_path):
     cmd = [
         'ffmpeg', '-i', video_filename, '-vf', f"select=gte(n\,{frame})", '-vframes', '1',
         '-s', '96x74', output_path, '-y'
     ]
+    # execute ffmpeg command to extract the frame as a thumbnail
     subprocess.run(cmd, capture_output=True)
 
-# Function to filter ranges, create thumbnails, write to XLS, and extract snippets
+# function to filter the frames, generate thumbnails, write data to an XLS file, and create video snippets
 def filter_and_write_xls_and_snippets(video_filename, xls_filename, fps=24):
     video_length_seconds = get_video_length(video_filename)
     total_frames = int(video_length_seconds * fps)
 
+    # Retrieve metadata from the xytech collection
     xytech_data = xytech_collection.find_one()
     producer = xytech_data.get('producer', '') if xytech_data else ''
     operator = xytech_data.get('operator', '') if xytech_data else ''
     job = xytech_data.get('job', '') if xytech_data else ''
 
+    # Set up the workbook and sheets
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Frames to Fix"
+    ws_frames_to_fix = wb.active
+    ws_frames_to_fix.title = "Frames to Fix"
 
-    ws_outside = wb.create_sheet("Out of Video Ranges")
+    ws_not_used = wb.create_sheet("Frames Not Used")
 
-    # Write metadata
-    ws.append(["Producer", producer])
-    ws.append(["Operator", operator])
-    ws.append(["Job", job])
-    ws.append([])
-    ws.append(["Location", "Frames to Fix", "Timecode", "Thumbnail"])
+    # Write metadata to "Frames to Fix" sheet
+    ws_frames_to_fix.append(["Producer", producer])
+    ws_frames_to_fix.append(["Operator", operator])
+    ws_frames_to_fix.append(["Job", job])
+    ws_frames_to_fix.append([])
+    ws_frames_to_fix.append(["Location", "Frames to Fix", "Timecode", "Thumbnail"])
 
-    ws_outside.append(["Location", "Frames to Fix", "Timecode"])
+    # Write headers to "Frames Not Used" sheet
+    ws_not_used.append(["Location", "Frames to Fix", "Timecode"])
 
+    # Process each record in the baselight collection
     entries = list(baselight_collection.find({}))
     for entry in entries:
         frame_data = entry['frame']
         location = entry['location']
 
-        if '-' in frame_data:  # Process ranges
+        # Check if it's a frame range
+        if '-' in frame_data:
             start, end = map(int, frame_data.split('-'))
             timecode = f"{frame_to_timecode(start, fps)} - {frame_to_timecode(end, fps)}"
-            if start <= total_frames and end <= total_frames:
-                # Valid ranges
+
+            if start <= total_frames and end <= total_frames:  # Valid range
+                # Add to "Frames to Fix" sheet
+                ws_frames_to_fix.append([location, frame_data, timecode])
                 middle_frame = (start + end) // 2
                 thumbnail_path = f"thumbnails/thumb_{start}_{end}.jpg"
                 generate_thumbnail(video_filename, middle_frame, thumbnail_path)
-
-                ws.append([location, frame_data, timecode])
                 img = OpenpyxlImage(thumbnail_path)
-                ws.add_image(img, f"D{ws.max_row}")
+                ws_frames_to_fix.add_image(img, f"D{ws_frames_to_fix.max_row}")
 
+                # Create video snippet
                 snippet_path = f"snippets/{start}-{end}.mp4"
                 cmd = [
                     'ffmpeg', '-i', video_filename,
@@ -166,34 +185,40 @@ def filter_and_write_xls_and_snippets(video_filename, xls_filename, fps=24):
                     '-c', 'copy', snippet_path
                 ]
                 subprocess.run(cmd, capture_output=True)
-            else:
-                # Out-of-range
-                ws_outside.append([location, frame_data, timecode])
+            else:  # Out-of-range range
+                ws_not_used.append([location, frame_data, timecode])
         else:
-            # Individual frames
+            # Process individual frame
             frame = int(frame_data)
             timecode = frame_to_timecode(frame, fps)
-            if frame > total_frames:
-                ws_outside.append([location, frame_data, timecode])
 
+            if frame <= total_frames:  # Valid individual frame
+                # Immediately add to "Frames Not Used" sheet
+                ws_not_used.append([location, frame_data, timecode])
+            else:  # Out-of-range individual frame
+                # Immediately add to "Frames Not Used" sheet
+                ws_not_used.append([location, frame_data, timecode])
+
+    # Save the workbook
     wb.save(xls_filename)
-    print(f"XLS file created with thumbnails and out-of-range data: {xls_filename}")
+    print(f"XLS file created with valid and unused frame data: {xls_filename}")
 
-# Main function with argparse
+# main function with argparse to handle command-line arguments
 def main():
-    parser = argparse.ArgumentParser(description="Process Baselight files, calculate timecodes, and generate XLS/snippets.")
-    parser.add_argument('--xytech', required=True, help="Path to the Xytech file")
-    parser.add_argument('--baselight', required=True, help="Path to the Baselight file")
-    parser.add_argument('--process', help="Path to the video file for XLS/snippet creation")
-    parser.add_argument('--outputXLS', help="Path to save the XLS file")
+    parser = argparse.ArgumentParser(description="process baselight files, calculate timecodes, and generate xls/snippets.")
+    parser.add_argument('--xytech', required=True, help="path to the xytech file")
+    parser.add_argument('--baselight', required=True, help="path to the baselight file")
+    parser.add_argument('--process', help="path to the video file for xls/snippet creation")
+    parser.add_argument('--outputXLS', help="path to save the xls file")
     args = parser.parse_args()
 
-    # Process Xytech file
+    # process the xytech file to get the location map
     location_map = process_xytech_file(args.xytech)
 
-    # Process Baselight file
+    # process the baselight file and store frame location mappings
     process_baselight_file(args.baselight, location_map)
 
+    # generate xls and snippets if the necessary arguments are provided
     if args.process and args.outputXLS:
         filter_and_write_xls_and_snippets(args.process, args.outputXLS)
 
