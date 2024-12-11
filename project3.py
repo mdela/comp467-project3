@@ -27,15 +27,38 @@ def frame_to_timecode(frame, fps):
     frames = frame % fps
     return f"{hours:02}:{minutes:02}:{seconds:02}:{frames:02}"
 
-# Function to process the Xytech file
+# Function to process the Xytech file and populate the xytech_collection
 def process_xytech_file(xytech_filename):
     location_map = {}
+    producer = ''
+    operator = ''
+    job = ''
+    notes = ''
+
     with open(xytech_filename, 'r') as xytech_file:
         for line in xytech_file:
             line = line.strip()
-            if line:
+            if line.startswith('Producer:'):
+                producer = line.split(':', 1)[1].strip()
+            elif line.startswith('Operator:'):
+                operator = line.split(':', 1)[1].strip()
+            elif line.startswith('Job:'):
+                job = line.split(':', 1)[1].strip()
+            elif line.startswith('Notes:'):
+                notes = line.split(':', 1)[1].strip()
+            elif line:
                 stripped_location = re.sub(r'^/hpsans\d+/production', '', line)
                 location_map[stripped_location] = line
+
+    # Populate the xytech_collection with metadata and locations
+    xytech_collection.insert_one({
+        'producer': producer,
+        'operator': operator,
+        'job': job,
+        'notes': notes,
+        'locations': [{'stripped': k, 'full': v} for k, v in location_map.items()]
+    })
+    print(f"Xytech data inserted into collection with producer: {producer}, operator: {operator}, job: {job}")
     return location_map
 
 # Function to process the Baselight file and populate the database
@@ -85,6 +108,7 @@ def process_baselight_file(baselight_filename, location_map):
             })
 
         i += 1
+    print(f"Baselight data inserted into collection from file: {baselight_filename}")
 
 # Function to calculate timecodes for ranges within the video length and write to XLS
 def filter_and_write_xls(video_filename, xls_filename, fps=24):
