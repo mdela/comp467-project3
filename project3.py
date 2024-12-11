@@ -4,12 +4,18 @@ import subprocess
 from pymongo import MongoClient
 import pandas as pd
 import os
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as OpenpyxlImage
 
 # MongoDB connection setup
 client = MongoClient('mongodb://localhost:27017/')
 db = client['video_processing']
 baselight_collection = db['baselight']
 xytech_collection = db['xytech']
+
+# Ensure necessary directories exist
+os.makedirs("thumbnails", exist_ok=True)
+os.makedirs("snippets", exist_ok=True)
 
 # Function to calculate video length using FFprobe
 def get_video_length(video_path):
@@ -78,7 +84,6 @@ def process_baselight_file(baselight_filename, location_map):
                     if frame.isdigit():
                         frames_locations[int(frame)] = location_fixed
 
-    # Merge consecutive frames into ranges and insert all data into the database
     frames_sorted = sorted(frames_locations.items())
     i = 0
     while i < len(frames_sorted):
@@ -103,8 +108,16 @@ def process_baselight_file(baselight_filename, location_map):
 
         i += 1
 
-# Function to calculate timecodes for ranges within the video length and write to XLS
-def filter_and_write_xls(video_filename, xls_filename, fps=24):
+# Function to generate a thumbnail for the middle frame of a range
+def generate_thumbnail(video_filename, frame, output_path):
+    cmd = [
+        'ffmpeg', '-i', video_filename, '-vf', f"select=gte(n\,{frame})", '-vframes', '1',
+        '-s', '96x74', output_path, '-y'
+    ]
+    subprocess.run(cmd, capture_output=True)
+
+# Function to filter ranges, create thumbnails, write to XLS, and extract snippets
+def filter_and_write_xls_and_snippets(video_filename, xls_filename, fps=24):
     video_length_seconds = get_video_length(video_filename)
     total_frames = int(video_length_seconds * fps)
 
@@ -113,10 +126,18 @@ def filter_and_write_xls(video_filename, xls_filename, fps=24):
     operator = xytech_data.get('operator', '') if xytech_data else ''
     job = xytech_data.get('job', '') if xytech_data else ''
 
-    # Filter ranges within video length and calculate timecodes
-    entries = list(baselight_collection.find({}))
-    rows = [["Producer", producer], ["Operator", operator], ["Job", job], [], ["Location", "Frames to Fix", "Timecode"]]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Frames to Fix"
 
+    # Write metadata
+    ws.append(["Producer", producer])
+    ws.append(["Operator", operator])
+    ws.append(["Job", job])
+    ws.append([])
+    ws.append(["Location", "Frames to Fix", "Timecode", "Thumbnail"])
+
+    entries = list(baselight_collection.find({}))
     for entry in entries:
         frame_data = entry['frame']
         location = entry['location']
@@ -127,45 +148,36 @@ def filter_and_write_xls(video_filename, xls_filename, fps=24):
                 start_timecode = frame_to_timecode(start, fps)
                 end_timecode = frame_to_timecode(end, fps)
                 timecode = f"{start_timecode} - {end_timecode}"
-                rows.append([location, frame_data, timecode])
 
-    # Write filtered ranges to XLS file
-    df = pd.DataFrame(rows)
-    df.to_excel(xls_filename, index=False, header=False, engine='openpyxl')
-    print(f"XLS file created with filtered ranges: {xls_filename}")
+                # Generate thumbnail
+                middle_frame = (start + end) // 2
+                thumbnail_path = f"thumbnails/thumb_{start}_{end}.jpg"
+                generate_thumbnail(video_filename, middle_frame, thumbnail_path)
 
-# Function to extract video snippets based on timecode ranges
-def extract_snippets(video_filename, fps=24):
-    video_length_seconds = get_video_length(video_filename)
-    total_frames = int(video_length_seconds * fps)
+                # Add thumbnail and snippet info
+                ws.append([location, frame_data, timecode])
+                img = OpenpyxlImage(thumbnail_path)
+                ws.add_image(img, f"D{ws.max_row}")
 
-    entries = list(baselight_collection.find({}))
-    os.makedirs("snippets", exist_ok=True)
-
-    for entry in entries:
-        frame_data = entry['frame']
-
-        if '-' in frame_data:  # Only process ranges
-            start, end = map(int, frame_data.split('-'))
-            if start <= total_frames and end <= total_frames:
-                start_time = start / fps
-                end_time = end / fps
-                output_file = f"snippets/{start}-{end}.mp4"
-
+                # Create snippet
+                snippet_path = f"snippets/{start}-{end}.mp4"
                 cmd = [
                     'ffmpeg', '-i', video_filename,
-                    '-ss', f"{start_time}", '-to', f"{end_time}",
-                    '-c', 'copy', output_file
+                    '-ss', f"{start / fps}", '-to', f"{end / fps}",
+                    '-c', 'copy', snippet_path
                 ]
                 subprocess.run(cmd, capture_output=True)
-                print(f"Snippet created: {output_file}")
+                print(f"Snippet created: {snippet_path}")
 
-# Main function with argparse for input files and XLS/snippet creation
+    wb.save(xls_filename)
+    print(f"XLS file created with thumbnails: {xls_filename}")
+
+# Main function with argparse
 def main():
     parser = argparse.ArgumentParser(description="Process Baselight files, calculate timecodes, and generate XLS/snippets.")
     parser.add_argument('--xytech', required=True, help="Path to the Xytech file")
     parser.add_argument('--baselight', required=True, help="Path to the Baselight file")
-    parser.add_argument('--process', help="Path to the video file for snippet creation")
+    parser.add_argument('--process', help="Path to the video file for XLS/snippet creation")
     parser.add_argument('--outputXLS', help="Path to save the XLS file")
     args = parser.parse_args()
 
@@ -175,13 +187,8 @@ def main():
     # Process Baselight file
     process_baselight_file(args.baselight, location_map)
 
-    if args.outputXLS:
-        # Filter ranges and write to XLS
-        filter_and_write_xls(args.process, args.outputXLS)
-
-    if args.process:
-        # Extract video snippets
-        extract_snippets(args.process)
+    if args.process and args.outputXLS:
+        filter_and_write_xls_and_snippets(args.process, args.outputXLS)
 
 if __name__ == '__main__':
     main()
